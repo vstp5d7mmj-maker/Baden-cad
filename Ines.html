@@ -1,0 +1,1051 @@
+<!doctype html>
+
+<html lang="de">
+
+<head>
+
+<meta charset="utf-8">
+
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+
+<meta name="apple-mobile-web-app-capable" content="yes">
+
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+<title>Baden CAD</title>
+
+<style>
+
+:root {
+
+  color-scheme: dark;
+
+  --bg:#111827; --panel:#1f2937; --line:#374151;
+
+  --accent:#38bdf8; --text:#f9fafb; --muted:#9ca3af;
+
+}
+
+* { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+
+html,body { width:100%; height:100%; margin:0; overflow:hidden; font-family:system-ui,sans-serif; }
+
+body { background:var(--bg); color:var(--text); display:flex; flex-direction:column; }
+
+header {
+
+  height:54px; display:flex; align-items:center; gap:8px;
+
+  padding:6px 10px; background:var(--panel); border-bottom:1px solid var(--line);
+
+}
+
+.brand { font-weight:750; white-space:nowrap; margin-right:4px; }
+
+.toolbar { display:flex; gap:6px; overflow-x:auto; flex:1; scrollbar-width:none; }
+
+button {
+
+  border:1px solid var(--line); background:#111827; color:var(--text);
+
+  border-radius:9px; min-height:40px; padding:7px 11px;
+
+  font-size:14px; font-weight:600; white-space:nowrap;
+
+}
+
+button.active { background:var(--accent); color:#062438; border-color:var(--accent); }
+
+button:disabled { opacity:.4; }
+
+.workspace { position:relative; flex:1; min-height:0; background:#f8fafc; }
+
+canvas { width:100%; height:100%; display:block; touch-action:none; }
+
+.measure {
+
+  position:absolute; left:10px; bottom:10px; display:flex; gap:6px;
+
+  padding:7px; border-radius:11px; background:rgba(17,24,39,.92);
+
+}
+
+.measure input {
+
+  width:88px; min-height:38px; border:1px solid var(--line);
+
+  border-radius:8px; background:#fff; color:#111827; padding:6px 8px;
+
+  font-size:16px;
+
+}
+
+.status {
+
+  height:30px; display:flex; align-items:center; justify-content:space-between;
+
+  padding:0 10px; background:var(--panel); color:var(--muted); font-size:12px;
+
+}
+
+#fileInput { display:none; }
+
+@media(max-width:700px) {
+
+  .brand { font-size:14px; }
+
+  header { height:58px; }
+
+  button { min-height:44px; }
+
+  .status span:first-child { max-width:70%; overflow:hidden; text-overflow:ellipsis; }
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<header>
+
+  <div class="brand">Baden CAD</div>
+
+  <div class="toolbar">
+
+    <button data-tool="select" class="active">Auswahl</button>
+
+    <button data-tool="line">Linie</button>
+
+    <button data-tool="rect">Rechteck</button>
+
+    <button data-tool="circle">Kreis</button>
+
+    <button data-tool="pan">Verschieben</button>
+
+    <button id="undo">↶</button>
+
+    <button id="redo">↷</button>
+
+    <button id="delete">Löschen</button>
+
+    <button id="save">Speichern</button>
+
+    <button id="exportProject">Projekt ↓</button>
+
+    <button id="importProject">Projekt ↑</button>
+
+    <button id="exportSvg">SVG ↓</button>
+
+    <button id="newProject">Neu</button>
+
+  </div>
+
+</header>
+
+<div class="workspace">
+
+  <canvas id="cad"></canvas>
+
+  <div class="measure">
+
+    <input id="measureA" type="number" inputmode="decimal" min="0" step="1" placeholder="Maß A cm">
+
+    <input id="measureB" type="number" inputmode="decimal" min="0" step="1" placeholder="Maß B cm">
+
+    <button id="applyMeasure">Setzen</button>
+
+  </div>
+
+</div>
+
+<div class="status">
+
+  <span id="message">Werkzeug: Auswahl</span>
+
+  <span id="coordinates">X 0 cm · Y 0 cm</span>
+
+</div>
+
+<input id="fileInput" type="file" accept=".json,.badencad,application/json">
+
+<script>
+
+(() => {
+
+  "use strict";
+
+  const canvas = document.querySelector("#cad");
+
+  const ctx = canvas.getContext("2d");
+
+  const message = document.querySelector("#message");
+
+  const coordinates = document.querySelector("#coordinates");
+
+  const measureA = document.querySelector("#measureA");
+
+  const measureB = document.querySelector("#measureB");
+
+  const fileInput = document.querySelector("#fileInput");
+
+  let shapes = [];
+
+  let selected = -1;
+
+  let tool = "select";
+
+  let preview = null;
+
+  let action = null;
+
+  let undoStack = [];
+
+  let redoStack = [];
+
+  let scale = 3;
+
+  let offset = { x: 100, y: 100 };
+
+  const snapSize = 10;
+
+  const pointers = new Map();
+
+  let pinch = null;
+
+  let gestureActive = false;
+
+  const clone = value => JSON.parse(JSON.stringify(value));
+
+  const distance = (a,b) => Math.hypot(b.x-a.x,b.y-a.y);
+
+  const snap = p => ({
+
+    x: Math.round(p.x/snapSize)*snapSize,
+
+    y: Math.round(p.y/snapSize)*snapSize
+
+  });
+
+  function screenToWorld(x,y) {
+
+    const r = canvas.getBoundingClientRect();
+
+    return { x:(x-r.left-offset.x)/scale, y:(y-r.top-offset.y)/scale };
+
+  }
+
+  function worldToScreen(p) {
+
+    return { x:p.x*scale+offset.x, y:p.y*scale+offset.y };
+
+  }
+
+  function setMessage(text) { message.textContent = text; }
+
+  function resize() {
+
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+
+    const r = canvas.getBoundingClientRect();
+
+    canvas.width = Math.round(r.width*dpr);
+
+    canvas.height = Math.round(r.height*dpr);
+
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+
+    draw();
+
+  }
+
+  function remember(snapshot = JSON.stringify(shapes)) {
+
+    undoStack.push(snapshot);
+
+    if (undoStack.length > 100) undoStack.shift();
+
+    redoStack = [];
+
+  }
+
+  function changed() {
+
+    localStorage.setItem("baden-cad-project", JSON.stringify({
+
+      version:1, unit:"cm", shapes
+
+    }));
+
+    updateButtons();
+
+    draw();
+
+  }
+
+  function updateButtons() {
+
+    document.querySelector("#undo").disabled = !undoStack.length;
+
+    document.querySelector("#redo").disabled = !redoStack.length;
+
+    document.querySelector("#delete").disabled = selected < 0;
+
+  }
+
+  function setTool(name) {
+
+    tool = name;
+
+    selected = name === "select" ? selected : -1;
+
+    preview = null;
+
+    action = null;
+
+    document.querySelectorAll("[data-tool]").forEach(button =>
+
+      button.classList.toggle("active", button.dataset.tool === name)
+
+    );
+
+    const names = {
+
+      select:"Auswahl", line:"Linie", rect:"Rechteck",
+
+      circle:"Kreis", pan:"Ansicht verschieben"
+
+    };
+
+    setMessage("Werkzeug: " + names[name]);
+
+    updateMeasureFields();
+
+    updateButtons();
+
+    draw();
+
+  }
+
+  function updateMeasureFields() {
+
+    measureA.value = "";
+
+    measureB.value = "";
+
+    if (selected < 0 || !shapes[selected]) return;
+
+    const s = shapes[selected];
+
+    if (s.type === "line") measureA.value = distance(s.a,s.b).toFixed(1);
+
+    if (s.type === "rect") {
+
+      measureA.value = Math.abs(s.b.x-s.a.x).toFixed(1);
+
+      measureB.value = Math.abs(s.b.y-s.a.y).toFixed(1);
+
+    }
+
+    if (s.type === "circle") measureA.value = s.r.toFixed(1);
+
+  }
+
+  function drawGrid(width,height) {
+
+    ctx.fillStyle = "#f8fafc";
+
+    ctx.fillRect(0,0,width,height);
+
+    let step = snapSize;
+
+    while (step*scale < 18) step *= 2;
+
+    while (step*scale > 70) step /= 2;
+
+    const left = -offset.x/scale;
+
+    const top = -offset.y/scale;
+
+    const right = (width-offset.x)/scale;
+
+    const bottom = (height-offset.y)/scale;
+
+    ctx.lineWidth = 1;
+
+    for (let x=Math.floor(left/step)*step; x<=right; x+=step) {
+
+      const sx = x*scale+offset.x;
+
+      const major = Math.round(x/step)%5 === 0;
+
+      ctx.strokeStyle = major ? "#cbd5e1" : "#e5e7eb";
+
+      ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,height); ctx.stroke();
+
+    }
+
+    for (let y=Math.floor(top/step)*step; y<=bottom; y+=step) {
+
+      const sy = y*scale+offset.y;
+
+      const major = Math.round(y/step)%5 === 0;
+
+      ctx.strokeStyle = major ? "#cbd5e1" : "#e5e7eb";
+
+      ctx.beginPath(); ctx.moveTo(0,sy); ctx.lineTo(width,sy); ctx.stroke();
+
+    }
+
+    const origin = worldToScreen({x:0,y:0});
+
+    ctx.strokeStyle = "#94a3b8";
+
+    ctx.lineWidth = 1.5;
+
+    ctx.beginPath(); ctx.moveTo(origin.x,0); ctx.lineTo(origin.x,height); ctx.stroke();
+
+    ctx.beginPath(); ctx.moveTo(0,origin.y); ctx.lineTo(width,origin.y); ctx.stroke();
+
+  }
+
+  function label(text,p) {
+
+    const q = worldToScreen(p);
+
+    ctx.font = "12px system-ui";
+
+    const w = ctx.measureText(text).width+10;
+
+    ctx.fillStyle = "rgba(15,23,42,.82)";
+
+    ctx.fillRect(q.x-w/2,q.y-22,w,18);
+
+    ctx.fillStyle = "#fff";
+
+    ctx.textAlign = "center";
+
+    ctx.fillText(text,q.x,q.y-9);
+
+  }
+
+  function drawShape(s,isSelected=false,isPreview=false) {
+
+    ctx.save();
+
+    ctx.strokeStyle = isSelected ? "#0284c7" : isPreview ? "#f59e0b" : "#111827";
+
+    ctx.fillStyle = isSelected ? "rgba(56,189,248,.10)" : "rgba(15,23,42,.035)";
+
+    ctx.lineWidth = isSelected ? 3 : 2;
+
+    ctx.setLineDash(isPreview ? [7,5] : []);
+
+    if (s.type === "line") {
+
+      const a=worldToScreen(s.a), b=worldToScreen(s.b);
+
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+
+      label(distance(s.a,s.b).toFixed(1)+" cm",
+
+        {x:(s.a.x+s.b.x)/2,y:(s.a.y+s.b.y)/2});
+
+    }
+
+    if (s.type === "rect") {
+
+      const a=worldToScreen(s.a), b=worldToScreen(s.b);
+
+      ctx.beginPath();
+
+      ctx.rect(a.x,a.y,b.x-a.x,b.y-a.y);
+
+      ctx.fill(); ctx.stroke();
+
+      label(
+
+        Math.abs(s.b.x-s.a.x).toFixed(1)+" × "+
+
+        Math.abs(s.b.y-s.a.y).toFixed(1)+" cm",
+
+        {x:(s.a.x+s.b.x)/2,y:(s.a.y+s.b.y)/2}
+
+      );
+
+    }
+
+    if (s.type === "circle") {
+
+      const c=worldToScreen(s.c);
+
+      ctx.beginPath(); ctx.arc(c.x,c.y,s.r*scale,0,Math.PI*2);
+
+      ctx.fill(); ctx.stroke();
+
+      label("R "+s.r.toFixed(1)+" cm",{x:s.c.x,y:s.c.y-s.r});
+
+    }
+
+    ctx.restore();
+
+  }
+
+  function draw() {
+
+    const r = canvas.getBoundingClientRect();
+
+    drawGrid(r.width,r.height);
+
+    shapes.forEach((shape,i) => drawShape(shape,i===selected,false));
+
+    if (preview) drawShape(preview,false,true);
+
+  }
+
+  function segmentDistance(p,a,b) {
+
+    const dx=b.x-a.x, dy=b.y-a.y;
+
+    const l2=dx*dx+dy*dy;
+
+    if (!l2) return distance(p,a);
+
+    const t=Math.max(0,Math.min(1,((p.x-a.x)*dx+(p.y-a.y)*dy)/l2));
+
+    return distance(p,{x:a.x+t*dx,y:a.y+t*dy});
+
+  }
+
+  function hitTest(p) {
+
+    const tolerance = 14/scale;
+
+    for (let i=shapes.length-1;i>=0;i--) {
+
+      const s=shapes[i];
+
+      if (s.type==="line" && segmentDistance(p,s.a,s.b)<=tolerance) return i;
+
+      if (s.type==="circle" &&
+
+          (Math.abs(distance(p,s.c)-s.r)<=tolerance || distance(p,s.c)<s.r)) return i;
+
+      if (s.type==="rect") {
+
+        const minX=Math.min(s.a.x,s.b.x)-tolerance;
+
+        const maxX=Math.max(s.a.x,s.b.x)+tolerance;
+
+        const minY=Math.min(s.a.y,s.b.y)-tolerance;
+
+        const maxY=Math.max(s.a.y,s.b.y)+tolerance;
+
+        if (p.x>=minX && p.x<=maxX && p.y>=minY && p.y<=maxY) return i;
+
+      }
+
+    }
+
+    return -1;
+
+  }
+
+  function translateShape(shape,dx,dy) {
+
+    const s=clone(shape);
+
+    if (s.type==="line" || s.type==="rect") {
+
+      s.a.x+=dx; s.a.y+=dy; s.b.x+=dx; s.b.y+=dy;
+
+    } else {
+
+      s.c.x+=dx; s.c.y+=dy;
+
+    }
+
+    return s;
+
+  }
+
+  function beginPinch() {
+
+    if (pointers.size!==2) return;
+
+    const pts=[...pointers.values()];
+
+    const mid={x:(pts[0].x+pts[1].x)/2,y:(pts[0].y+pts[1].y)/2};
+
+    pinch={
+
+      distance:distance(pts[0],pts[1]),
+
+      scale,
+
+      offset:{...offset},
+
+      mid,
+
+      world:screenToWorld(mid.x,mid.y)
+
+    };
+
+    action=null;
+
+    preview=null;
+
+    gestureActive=true;
+
+  }
+
+  canvas.addEventListener("pointerdown", event => {
+
+    canvas.setPointerCapture(event.pointerId);
+
+    pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+
+    if (pointers.size===2) { beginPinch(); return; }
+
+    if (gestureActive) return;
+
+    const raw=screenToWorld(event.clientX,event.clientY);
+
+    const p=snap(raw);
+
+    if (tool==="pan") {
+
+      action={kind:"pan",screen:{x:event.clientX,y:event.clientY},offset:{...offset}};
+
+      return;
+
+    }
+
+    if (tool==="select") {
+
+      selected=hitTest(raw);
+
+      if (selected>=0) {
+
+        action={
+
+          kind:"drag",start:p,original:clone(shapes[selected]),
+
+          snapshot:JSON.stringify(shapes),moved:false
+
+        };
+
+      }
+
+      updateMeasureFields(); updateButtons(); draw();
+
+      return;
+
+    }
+
+    action={kind:"draw",start:p};
+
+    if (tool==="line") preview={type:"line",a:p,b:p};
+
+    if (tool==="rect") preview={type:"rect",a:p,b:p};
+
+    if (tool==="circle") preview={type:"circle",c:p,r:0};
+
+    draw();
+
+  });
+
+  canvas.addEventListener("pointermove", event => {
+
+    if (pointers.has(event.pointerId))
+
+      pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+
+    if (pointers.size===2 && pinch) {
+
+      const pts=[...pointers.values()];
+
+      const mid={x:(pts[0].x+pts[1].x)/2,y:(pts[0].y+pts[1].y)/2};
+
+      const ratio=distance(pts[0],pts[1])/Math.max(1,pinch.distance);
+
+      scale=Math.max(.25,Math.min(30,pinch.scale*ratio));
+
+      offset.x=mid.x-pinch.world.x*scale;
+
+      offset.y=mid.y-pinch.world.y*scale;
+
+      draw();
+
+      return;
+
+    }
+
+    const raw=screenToWorld(event.clientX,event.clientY);
+
+    const p=snap(raw);
+
+    coordinates.textContent=`X ${p.x.toFixed(0)} cm · Y ${p.y.toFixed(0)} cm`;
+
+    if (!action || gestureActive) return;
+
+    if (action.kind==="pan") {
+
+      offset.x=action.offset.x+event.clientX-action.screen.x;
+
+      offset.y=action.offset.y+event.clientY-action.screen.y;
+
+    }
+
+    if (action.kind==="drag" && selected>=0) {
+
+      const dx=p.x-action.start.x, dy=p.y-action.start.y;
+
+      if (dx || dy) action.moved=true;
+
+      shapes[selected]=translateShape(action.original,dx,dy);
+
+    }
+
+    if (action.kind==="draw" && preview) {
+
+      if (preview.type==="line" || preview.type==="rect") preview.b=p;
+
+      if (preview.type==="circle") preview.r=distance(preview.c,p);
+
+    }
+
+    draw();
+
+  });
+
+  function finishPointer(event) {
+
+    pointers.delete(event.pointerId);
+
+    if (pinch) {
+
+      if (pointers.size<2) pinch=null;
+
+      if (pointers.size===0) gestureActive=false;
+
+      return;
+
+    }
+
+    if (gestureActive) {
+
+      if (pointers.size===0) gestureActive=false;
+
+      return;
+
+    }
+
+    if (!action) return;
+
+    if (action.kind==="drag" && action.moved) {
+
+      undoStack.push(action.snapshot);
+
+      redoStack=[];
+
+      changed();
+
+    }
+
+    if (action.kind==="draw" && preview) {
+
+      const valid=preview.type==="circle" ? preview.r>0 : distance(preview.a,preview.b)>0;
+
+      if (valid) {
+
+        remember();
+
+        shapes.push(preview);
+
+        selected=shapes.length-1;
+
+        changed();
+
+        setTool("select");
+
+      }
+
+    }
+
+    action=null;
+
+    preview=null;
+
+    draw();
+
+  }
+
+  canvas.addEventListener("pointerup",finishPointer);
+
+  canvas.addEventListener("pointercancel",finishPointer);
+
+  canvas.addEventListener("wheel",event => {
+
+    event.preventDefault();
+
+    const before=screenToWorld(event.clientX,event.clientY);
+
+    scale=Math.max(.25,Math.min(30,scale*(event.deltaY<0?1.12:.89)));
+
+    const r=canvas.getBoundingClientRect();
+
+    offset.x=event.clientX-r.left-before.x*scale;
+
+    offset.y=event.clientY-r.top-before.y*scale;
+
+    draw();
+
+  },{passive:false});
+
+  document.querySelectorAll("[data-tool]").forEach(button =>
+
+    button.addEventListener("click",()=>setTool(button.dataset.tool))
+
+  );
+
+  document.querySelector("#undo").addEventListener("click",()=>{
+
+    if (!undoStack.length) return;
+
+    redoStack.push(JSON.stringify(shapes));
+
+    shapes=JSON.parse(undoStack.pop());
+
+    selected=-1; changed();
+
+  });
+
+  document.querySelector("#redo").addEventListener("click",()=>{
+
+    if (!redoStack.length) return;
+
+    undoStack.push(JSON.stringify(shapes));
+
+    shapes=JSON.parse(redoStack.pop());
+
+    selected=-1; changed();
+
+  });
+
+  document.querySelector("#delete").addEventListener("click",()=>{
+
+    if (selected<0) return;
+
+    remember(); shapes.splice(selected,1); selected=-1; changed();
+
+  });
+
+  document.querySelector("#applyMeasure").addEventListener("click",()=>{
+
+    if (selected<0) { setMessage("Zuerst ein Objekt auswählen."); return; }
+
+    const a=parseFloat(measureA.value);
+
+    const b=parseFloat(measureB.value);
+
+    if (!(a>0)) return;
+
+    remember();
+
+    const s=shapes[selected];
+
+    if (s.type==="line") {
+
+      const angle=Math.atan2(s.b.y-s.a.y,s.b.x-s.a.x);
+
+      s.b={x:s.a.x+Math.cos(angle)*a,y:s.a.y+Math.sin(angle)*a};
+
+    }
+
+    if (s.type==="rect") {
+
+      const sx=s.b.x>=s.a.x?1:-1, sy=s.b.y>=s.a.y?1:-1;
+
+      s.b.x=s.a.x+a*sx;
+
+      if (b>0) s.b.y=s.a.y+b*sy;
+
+    }
+
+    if (s.type==="circle") s.r=a;
+
+    changed(); updateMeasureFields();
+
+  });
+
+  document.querySelector("#save").addEventListener("click",()=>{
+
+    changed(); setMessage("Projekt lokal auf diesem iPad gespeichert.");
+
+  });
+
+  document.querySelector("#newProject").addEventListener("click",()=>{
+
+    if (!confirm("Neues Projekt? Die aktuelle Zeichnung wird geleert.")) return;
+
+    remember(); shapes=[]; selected=-1; changed();
+
+  });
+
+  function download(name,type,content) {
+
+    const blob=new Blob([content],{type});
+
+    const url=URL.createObjectURL(blob);
+
+    const a=document.createElement("a");
+
+    a.href=url; a.download=name; a.click();
+
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+
+  }
+
+  document.querySelector("#exportProject").addEventListener("click",()=>{
+
+    download("baden-cad.badencad","application/json",
+
+      JSON.stringify({version:1,unit:"cm",shapes},null,2));
+
+  });
+
+  document.querySelector("#importProject").addEventListener("click",()=>fileInput.click());
+
+  fileInput.addEventListener("change",async()=>{
+
+    const file=fileInput.files[0];
+
+    if (!file) return;
+
+    try {
+
+      const data=JSON.parse(await file.text());
+
+      if (!Array.isArray(data.shapes)) throw new Error();
+
+      remember(); shapes=data.shapes; selected=-1; changed();
+
+      setMessage("Projekt geladen.");
+
+    } catch {
+
+      alert("Diese Projektdatei konnte nicht gelesen werden.");
+
+    }
+
+    fileInput.value="";
+
+  });
+
+  document.querySelector("#exportSvg").addEventListener("click",()=>{
+
+    if (!shapes.length) { alert("Die Zeichnung ist leer."); return; }
+
+    const points=[];
+
+    shapes.forEach(s=>{
+
+      if (s.type==="line" || s.type==="rect") points.push(s.a,s.b);
+
+      if (s.type==="circle") {
+
+        points.push({x:s.c.x-s.r,y:s.c.y-s.r},{x:s.c.x+s.r,y:s.c.y+s.r});
+
+      }
+
+    });
+
+    const pad=20;
+
+    const minX=Math.min(...points.map(p=>p.x))-pad;
+
+    const minY=Math.min(...points.map(p=>p.y))-pad;
+
+    const maxX=Math.max(...points.map(p=>p.x))+pad;
+
+    const maxY=Math.max(...points.map(p=>p.y))+pad;
+
+    const width=maxX-minX, height=maxY-minY;
+
+    const elements=shapes.map(s=>{
+
+      if (s.type==="line")
+
+        return `<line x1="${s.a.x}" y1="${s.a.y}" x2="${s.b.x}" y2="${s.b.y}"/>`;
+
+      if (s.type==="rect")
+
+        return `<rect x="${Math.min(s.a.x,s.b.x)}" y="${Math.min(s.a.y,s.b.y)}" width="${Math.abs(s.b.x-s.a.x)}" height="${Math.abs(s.b.y-s.a.y)}"/>`;
+
+      return `<circle cx="${s.c.x}" cy="${s.c.y}" r="${s.r}"/>`;
+
+    }).join("\n");
+
+    const svg=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="${minX} ${minY} ${width} ${height}" width="${width}cm" height="${height}cm">
+
+<g fill="none" stroke="#000" stroke-width="0.3" vector-effect="non-scaling-stroke">
+
+${elements}
+
+</g>
+
+</svg>`;
+
+    download("baden-cad.svg","image/svg+xml",svg);
+
+  });
+
+  window.addEventListener("keydown",event=>{
+
+    if ((event.metaKey||event.ctrlKey) && event.key.toLowerCase()==="z") {
+
+      event.preventDefault();
+
+      document.querySelector(event.shiftKey?"#redo":"#undo").click();
+
+    }
+
+    if (event.key==="Delete" || event.key==="Backspace")
+
+      document.querySelector("#delete").click();
+
+    if (event.key==="Escape") setTool("select");
+
+  });
+
+  const saved=localStorage.getItem("baden-cad-project");
+
+  if (saved) {
+
+    try {
+
+      const data=JSON.parse(saved);
+
+      if (Array.isArray(data.shapes)) shapes=data.shapes;
+
+    } catch {}
+
+  }
+
+  window.addEventListener("resize",resize);
+
+  new ResizeObserver(resize).observe(canvas);
+
+  updateButtons();
+
+  resize();
+
+})();
+
+</script>
+
+</body>
+
+</html>
